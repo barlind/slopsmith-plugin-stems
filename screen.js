@@ -69,6 +69,8 @@
     let container = null;              // UI container in #player-controls
     let currentFilename = null;
     const claimSnapshots = new Map();  // claimId:stemId -> previous session-only state
+    const registeredMixParticipantIds = new Set();
+    let coreAudioBinding = null;
     // Pending poll fallback for the cold-load race. Tracked at module
     // scope so teardown() can cancel it whenever the previous play is
     // abandoned (new song, or leaving the player), preventing an
@@ -122,15 +124,13 @@
         }
         // Restore the core audio element first so playback isn't interrupted
         // while we clean up.
+        unhookCoreAudio();
         const core = document.getElementById('audio');
         if (core) {
             core.volume = 1;
             core.muted = false;
-            core.onplay = null;
-            core.onpause = null;
-            core.onseeking = null;
-            core.onratechange = null;
         }
+        unregisterStemMixParticipants();
         for (const s of stemState) {
             try { s.audio.pause(); } catch (_) {}
             try { s.source && s.source.disconnect(); } catch (_) {}
@@ -140,6 +140,7 @@
         }
         stemState = [];
         claimSnapshots.clear();
+        registerStemOwnerStatus('unavailable');
         if (container) {
             container.remove();
             container = null;
@@ -182,6 +183,7 @@
                 s.gain.gain.value = s.on ? s.vol : 0;
                 btn.className = s.on ? ON_CLASS : OFF_CLASS;
                 saveMuted(currentFilename, stemState);
+                registerStemOwnerStatus('available');
                 recordStemUserOverride(s, 'User toggled Stems mute');
             };
             s.btn = btn;
@@ -221,6 +223,7 @@
             s.vol = Number(slider.value) / 100;
             if (s.on) s.gain.gain.value = s.vol;
             saveVolume(currentFilename, s.id, s.vol);
+            registerStemOwnerStatus('available');
         };
         slider.onclick = (e) => e.stopPropagation();
         pop.appendChild(slider);
@@ -238,9 +241,19 @@
     }
 
     // ── Core audio sync ──
+    function unhookCoreAudio() {
+        if (!coreAudioBinding) return;
+        const binding = coreAudioBinding;
+        coreAudioBinding = null;
+        for (const [eventName, handler] of binding.listeners) {
+            try { binding.core.removeEventListener(eventName, handler); } catch (_) {}
+        }
+    }
+
     function hookCoreAudio() {
         const core = document.getElementById('audio');
         if (!core) return;
+        unhookCoreAudio();
 
         // Core element is the timing master — silent.
         // Set BOTH .volume = 0 and .muted = true. The volume mute alone
@@ -255,7 +268,7 @@
 
         const DRIFT_THRESHOLD = 0.05; // 50 ms — seek stems back in sync on play
 
-        core.onplay = () => {
+        const onPlay = () => {
             if (ctx && ctx.state === 'suspended') ctx.resume();
             for (const s of stemState) {
                 if (Math.abs(s.audio.currentTime - core.currentTime) > DRIFT_THRESHOLD) {
@@ -265,21 +278,29 @@
                 if (p && p.catch) p.catch(() => {});
             }
         };
-        core.onpause = () => {
+        const onPause = () => {
             for (const s of stemState) {
                 try { s.audio.pause(); } catch (_) {}
             }
         };
-        core.onseeking = () => {
+        const onSeeking = () => {
             for (const s of stemState) {
                 try { s.audio.currentTime = core.currentTime; } catch (_) {}
             }
         };
-        core.onratechange = () => {
+        const onRateChange = () => {
             for (const s of stemState) {
                 s.audio.playbackRate = core.playbackRate;
             }
         };
+        const listeners = [
+            ['play', onPlay],
+            ['pause', onPause],
+            ['seeking', onSeeking],
+            ['ratechange', onRateChange],
+        ];
+        for (const [eventName, handler] of listeners) core.addEventListener(eventName, handler);
+        coreAudioBinding = { core, listeners };
     }
 
     // ── Build graph for a sloppak ──
@@ -323,6 +344,8 @@
 
             return { id: s.id, url: s.url, default: s.default, audio, source, gain, on, vol };
         });
+        registerStemMixParticipants();
+        registerStemOwnerStatus('available');
     }
 
     // ── Main entry: called after song_info arrives ──
@@ -444,6 +467,96 @@
         return window.slopsmith && window.slopsmith.capabilities;
     }
 
+    function audioSessionApi() {
+        const session = window.slopsmith && window.slopsmith.audioSession;
+        return session && session.version === 1 ? session : null;
+    }
+
+    function safeStemId(id) {
+        return String(id || 'stem').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'stem';
+    }
+
+    function stemStatesSnapshot() {
+        const snapshot = {};
+        for (const stem of stemState) {
+            snapshot[stem.id] = { id: stem.id, on: !!stem.on, muted: !stem.on, vol: stem.vol };
+        }
+        return snapshot;
+    }
+
+    function registerStemOwnerStatus(availability) {
+        const session = audioSessionApi();
+        if (!session || typeof session.registerStemOwner !== 'function') return;
+        try {
+            session.registerStemOwner({
+                ownerId: 'stems.provider',
+                participantId: 'stems.provider',
+                availability,
+                stemIds: stemState.map(stem => stem.id),
+                stemStates: stemStatesSnapshot(),
+            });
+        } catch (err) {
+            console.warn('[stems] could not register stem owner:', err);
+        }
+    }
+
+    function stemParticipantId(stem) {
+        return `stems.${safeStemId(stem && stem.id)}`;
+    }
+
+    function registerStemMixParticipant(stem) {
+        const session = audioSessionApi();
+        if (!session || typeof session.registerMixParticipant !== 'function' || !stem) return;
+        const participantId = stemParticipantId(stem);
+        try {
+            session.registerMixParticipant({
+                participantId,
+                ownerPluginId: 'stems',
+                label: `Stem: ${stem.id}`,
+                kind: 'stem',
+                sourceMode: 'native',
+                logicalFaderKey: `stems:${safeStemId(stem.id)}`,
+                fader: {
+                    id: safeStemId(stem.id),
+                    label: stem.id,
+                    min: 0,
+                    max: 1,
+                    step: 0.01,
+                    defaultValue: 1,
+                    currentValue: stem.vol,
+                },
+                operations: ['fader.get-value', 'fader.set-value'],
+                operationHandlers: {
+                    'fader.get-value': () => stem.vol,
+                    'fader.set-value': (value) => {
+                        const committed = stemsApi.setVolume(stem.id, value);
+                        return { committedValue: committed };
+                    },
+                },
+                availability: 'available',
+                version: 1,
+            });
+            registeredMixParticipantIds.add(participantId);
+        } catch (err) {
+            console.warn('[stems] could not register audio-mix fader:', err);
+        }
+    }
+
+    function registerStemMixParticipants() {
+        unregisterStemMixParticipants();
+        for (const stem of stemState) registerStemMixParticipant(stem);
+    }
+
+    function unregisterStemMixParticipants() {
+        const session = audioSessionApi();
+        if (session && typeof session.unregisterMixParticipant === 'function') {
+            for (const participantId of registeredMixParticipantIds) {
+                try { session.unregisterMixParticipant(participantId); } catch (_) {}
+            }
+        }
+        registeredMixParticipantIds.clear();
+    }
+
     function isGuitarStemId(id) {
         return /(^|[-_\s])(guitars?|rhythm|lead|dist|distortion)([-_\s]|$)/i.test(String(id || ''));
     }
@@ -453,6 +566,7 @@
         stem.on = !!on;
         stem.gain.gain.value = stem.on ? stem.vol : 0;
         if (stem.btn) stem.btn.className = stem.on ? ON_CLASS : OFF_CLASS;
+        registerStemOwnerStatus('available');
     }
 
     function emitStemsState(event, payload = {}) {
@@ -469,6 +583,11 @@
     }
 
     function recordStemUserOverride(stem, reason) {
+        const session = audioSessionApi();
+        if (session && typeof session.recordStemManualOverride === 'function') {
+            try { session.recordStemManualOverride({ requester: 'user', stemIds: [stem.id], reason }); }
+            catch (_) {}
+        }
         const api = capabilityApi();
         if (!api || typeof api.recordUserOverride !== 'function') return;
         api.recordUserOverride({
@@ -503,9 +622,22 @@
 
     function capMute(ctx = {}) {
         const payload = ctx.payload || {};
-        const claimId = claimIdFromContext(ctx);
+        const targets = capabilityTargets(payload);
+        let claimId = claimIdFromContext(ctx);
+        const session = audioSessionApi();
+        if (session && typeof session.muteStems === 'function') {
+            try {
+                const result = session.muteStems({
+                    claimId,
+                    requester: ctx.requester || payload.requester || 'stems.capability',
+                    stemIds: targets.map(stem => stem.id),
+                    restoreSnapshot: stemStatesSnapshot(),
+                });
+                claimId = claimId || (result && result.payload && result.payload.claimId) || null;
+            } catch (_) {}
+        }
         const mutedIds = [];
-        for (const stem of capabilityTargets(payload)) {
+        for (const stem of targets) {
             if (claimId) {
                 const key = `${claimId}:${stem.id}`;
                 if (!claimSnapshots.has(key)) claimSnapshots.set(key, { claimId, id: stem.id, prevOn: stem.on, prevVol: stem.vol, filename: currentFilename });
@@ -518,6 +650,11 @@
 
     function capRestore(ctx = {}) {
         const claimId = claimIdFromContext(ctx);
+        const session = audioSessionApi();
+        if (session && typeof session.restoreStems === 'function' && claimId) {
+            try { session.restoreStems({ claimId, requester: ctx.requester || 'stems.capability' }); }
+            catch (_) {}
+        }
         const restoredIds = [];
         for (const [key, previous] of Array.from(claimSnapshots.entries())) {
             if (claimId && previous.claimId !== claimId) continue;
@@ -595,7 +732,20 @@
                 version: 1,
                 runtime: true,
             },
+            'audio-mix': {
+                roles: ['provider'],
+                operations: ['fader.get-value', 'fader.set-value'],
+                events: ['fader-value-changed', 'fader-unavailable'],
+                description: 'Registers per-stem faders with the core audio-mix coordinator while Stems owns the media graph.',
+                compatibility: 'none',
+                ownership: 'multi-provider',
+                safety: 'safe',
+                version: 1,
+                runtime: true,
+            },
         });
+        registerStemMixParticipants();
+        registerStemOwnerStatus(stemState.length ? 'available' : 'unavailable');
         emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });
     }
 
@@ -624,14 +774,16 @@
         })),
         setVolume(id, vol) {
             const v = Number(vol);
-            if (!Number.isFinite(v)) return;
+            if (!Number.isFinite(v)) return undefined;
             const target = String(id).toLowerCase();
             const clamped = Math.max(0, Math.min(1, v));
+            let applied = false;
             for (const s of stemState) {
                 if (s.id.toLowerCase() !== target) continue;
                 s.vol = clamped;
                 if (s.on) s.gain.gain.value = clamped;
                 saveVolume(currentFilename, s.id, clamped);
+                applied = true;
                 if (container) {
                     const ranges = container.querySelectorAll('.stems-vol-popover input[type=range]');
                     for (const pop of ranges) {
@@ -641,17 +793,22 @@
                     }
                 }
             }
+            if (applied) registerStemOwnerStatus('available');
+            return applied ? clamped : undefined;
         },
         setMuted(id, muted) {
             const m = coerceBool(muted);
             const target = String(id).toLowerCase();
+            let applied = false;
             for (const s of stemState) {
                 if (s.id.toLowerCase() !== target) continue;
                 s.on = !m;
                 s.gain.gain.value = s.on ? s.vol : 0;
                 if (s.btn) s.btn.className = s.on ? ON_CLASS : OFF_CLASS;
                 saveMuted(currentFilename, stemState);
+                applied = true;
             }
+            if (applied) registerStemOwnerStatus('available');
         },
     };
     Object.defineProperty(stemsApi, 'stemState', {
