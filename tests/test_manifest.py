@@ -104,4 +104,13 @@ def test_screen_reports_missing_set_volume_target():
 
     assert "const committed = stemsApi.setVolume" in src
     assert "if (committed === undefined)" in src
+    assert "Stem ${stem.id} is no longer available" in src
     assert "committedValue: committed" in src
+
+
+def test_screen_requires_claim_id_for_restore():
+    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+
+    assert "Restore requires a claimId" in src
+    assert "if (previous.claimId !== claimId) continue" in src
+    assert "if (claimId && previous.claimId !== claimId) continue" not in src
